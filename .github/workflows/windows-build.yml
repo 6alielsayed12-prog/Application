@@ -1,0 +1,186 @@
+name: Windows Production Build & Verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build, Test & Package (Windows x64 / Python 3.12)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      APP_VERSION: "1.3.0"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Verify Python 3.12 x64 runtime
+        id: pycheck
+        run: |
+          python --version
+          python -c "import sys, platform; assert sys.version_info[:2] == (3, 12), sys.version; assert platform.architecture()[0] == '64bit', platform.architecture(); print('Verified Python 3.12 x64')"
+
+      - name: Create isolated virtual environment & install dependencies
+        id: deps
+        run: |
+          New-Item -ItemType Directory -Force -Path build_logs, release | Out-Null
+          python -m venv .venv
+          & .\.venv\Scripts\python.exe -m pip install --upgrade pip | Tee-Object -FilePath build_logs/pip-install.log
+          if (Test-Path "requirements.lock") {
+            Write-Host "Installing pinned dependencies from requirements.lock..."
+            & .\.venv\Scripts\python.exe -m pip install -r requirements.lock 2>&1 | Tee-Object -Append -FilePath build_logs/pip-install.log
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements.lock" }
+          }
+          & .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt 2>&1 | Tee-Object -Append -FilePath build_logs/pip-install.log
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements-build.txt" }
+          & .\.venv\Scripts\python.exe -m pip install "pywebview>=5.0" 2>&1 | Tee-Object -Append -FilePath build_logs/pip-install.log
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install pywebview" }
+          & .\.venv\Scripts\python.exe -m pip freeze --exclude-editable | Out-File -Encoding utf8 build-freeze.txt
+
+      - name: Run full automated test suite
+        id: tests
+        run: |
+          & .\.venv\Scripts\python.exe -m unittest discover -s tests -t . -v 2>&1 | Tee-Object -FilePath build_logs/test-suite.log
+          if ($LASTEXITCODE -ne 0) { throw "Unit/integration test suite failed (exit $LASTEXITCODE)" }
+
+      - name: Build Windows executable (PyInstaller)
+        id: pyinstaller
+        run: |
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          & .\.venv\Scripts\python.exe -m PyInstaller YawmJadidAcademy.spec --noconfirm --clean 2>&1 | Tee-Object -FilePath build_logs/pyinstaller.log
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed (exit $LASTEXITCODE)" }
+          if (-not (Test-Path "dist/YawmJadidAcademy/YawmJadidAcademy.exe")) {
+            throw "PyInstaller completed but dist/YawmJadidAcademy/YawmJadidAcademy.exe is missing"
+          }
+
+      - name: Verify built EXE and dist payload
+        id: verify
+        run: |
+          & .\.venv\Scripts\python.exe scripts/verify_build_artifact.py "dist/YawmJadidAcademy/YawmJadidAcademy.exe" --ui-dir "dist/YawmJadidAcademy/_internal/alahd_erp/ui" --expected-python 3.12 --strict --json | Out-File -Encoding utf8 build_logs/artifact-verification.json
+          if ($LASTEXITCODE -ne 0) { throw "verify_build_artifact.py failed" }
+          & .\.venv\Scripts\python.exe scripts/verify_build.py --dist "dist/YawmJadidAcademy" --report build_verification_report.json 2>&1 | Tee-Object -FilePath build_logs/verify-build.log
+          if ($LASTEXITCODE -ne 0) { throw "verify_build.py failed" }
+
+      - name: Run Windows EXE headless smoke test
+        id: smoke
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke_exe.ps1 -ExePath "dist/YawmJadidAcademy/YawmJadidAcademy.exe" 2>&1 | Tee-Object -FilePath build_logs/smoke-exe.log
+          if ($LASTEXITCODE -ne 0) { throw "smoke_exe.ps1 failed" }
+
+      - name: Package portable ZIP distribution
+        id: portable
+        run: |
+          $zipPath = "release/YawmJadidAcademy-$env:APP_VERSION-portable.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          Compress-Archive -Path "dist/YawmJadidAcademy" -DestinationPath $zipPath -Force
+          if (-not (Test-Path $zipPath)) { throw "Failed to create $zipPath" }
+
+      - name: Install Inno Setup 6 and compile installer
+        id: installer
+        run: |
+          choco install innosetup -y --no-progress 2>&1 | Tee-Object -FilePath build_logs/innosetup-install.log
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install Inno Setup 6" }
+          $iscc = @(
+            (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after Inno Setup 6 installation" }
+          & $iscc "installer\YawmJadidAcademy.iss" 2>&1 | Tee-Object -FilePath build_logs/innosetup-compile.log
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
+          $setupExe = "installer/Output/YawmJadidAcademy-Setup-$env:APP_VERSION.exe"
+          if (-not (Test-Path $setupExe)) { throw "Installer output missing: $setupExe" }
+
+      - name: Generate release metadata & checksums
+        id: metadata
+        run: |
+          $files = @(
+            "dist/YawmJadidAcademy/YawmJadidAcademy.exe",
+            "release/YawmJadidAcademy-$env:APP_VERSION-portable.zip",
+            "installer/Output/YawmJadidAcademy-Setup-$env:APP_VERSION.exe"
+          )
+          $entries = @()
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              $h = Get-FileHash -Path $f -Algorithm SHA256
+              $item = Get-Item $f
+              $entries += [ordered]@{
+                path = $f
+                bytes = $item.Length
+                sha256 = $h.Hash.ToLowerInvariant()
+              }
+            }
+          }
+          $meta = [ordered]@{
+            version = $env:APP_VERSION
+            commit = $env:GITHUB_SHA
+            ref = $env:GITHUB_REF
+            runner = "windows-latest"
+            python = "3.12-x64"
+            artifacts = $entries
+          }
+          $meta | ConvertTo-Json -Depth 5 | Out-File -Encoding utf8 release/release-metadata.json
+
+      - name: Upload build logs and verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-${{ github.run_number }}
+          path: |
+            build_logs/
+            build-freeze.txt
+            build_verification_report.json
+            release/release-metadata.json
+          if-no-files-found: warn
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: YawmJadidAcademy-${{ env.APP_VERSION }}-windows-x64
+          path: |
+            release/YawmJadidAcademy-1.3.0-portable.zip
+            installer/Output/YawmJadidAcademy-Setup-1.3.0.exe
+          if-no-files-found: error
+
+      - name: Write build summary
+        if: always()
+        run: |
+          @"
+          ## YawmJadidAcademy v$env:APP_VERSION — Windows x64 Build Summary
+          | Stage | Outcome |
+          |---|---|
+          | Python 3.12 x64 Check | ${{ steps.pycheck.outcome }} |
+          | Dependencies & Freeze | ${{ steps.deps.outcome }} |
+          | Test Suite | ${{ steps.tests.outcome }} |
+          | PyInstaller EXE Build | ${{ steps.pyinstaller.outcome }} |
+          | Artifact & Dist Verification | ${{ steps.verify.outcome }} |
+          | EXE Headless Smoke Test | ${{ steps.smoke.outcome }} |
+          | Portable ZIP Packaging | ${{ steps.portable.outcome }} |
+          | Inno Setup 6 Installer | ${{ steps.installer.outcome }} |
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
